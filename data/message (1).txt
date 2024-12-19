@@ -1,0 +1,138 @@
+ @action(detail=False, methods=['get'])
+    def recommendations(self, request):
+        """사용자 맞춤 추천 API"""
+        if not request.user.is_authenticated:
+            return Response({"error": "로그인이 필요합니다."}, status=401)
+
+        user = request.user
+        try:
+            preference = UserPreference.objects.get(user=user)
+        except UserPreference.DoesNotExist:
+            return Response({"error": "사용자 선호도 정보가 없습니다."}, status=400)
+
+        # 기본 쿼리셋
+        queryset = SaleTransaction.objects.select_related(
+            'building', 'building__region'
+        ).annotate(
+            price_per_area=F('price') / F('area')
+        )
+
+        # 선호도 기반 필터링
+        if preference.min_price:
+            queryset = queryset.filter(price__gte=preference.min_price)
+        if preference.max_price:
+            queryset = queryset.filter(price__lte=preference.max_price)
+        if preference.preferred_building_types:
+            queryset = queryset.filter(
+                building__building_type__in=preference.preferred_building_types
+            )
+        if preference.min_area:
+            queryset = queryset.filter(area__gte=preference.min_area)
+        if preference.max_area:
+            queryset = queryset.filter(area__lte=preference.max_area)
+        if preference.preferred_floor_range:
+            queryset = queryset.filter(
+                floor__range=preference.preferred_floor_range
+            )
+        if preference.max_distance_to_subway:
+            queryset = queryset.filter(
+                building__distance_to_subway__lte=preference.max_distance_to_subway
+            )
+        if preference.required_amenities:
+            for amenity in preference.required_amenities:
+                queryset = queryset.filter(
+                    building__nearby_amenities__contains=[amenity]
+                )
+
+        # 선호 지역 가중치 적용
+        if preference.preferred_regions.exists():
+            preferred_regions = preference.preferred_regions.all()
+            queryset = queryset.annotate(
+                is_preferred_region=Case(
+                    When(building__region__in=preferred_regions, then=1),
+                    default=0,
+                    output_field=IntegerField(),
+                )
+            )
+        
+        # 검색 기록 기반 추천
+        recent_searches = UserSearchHistory.objects.filter(
+            user=user
+        ).order_by('-created_at')[:5]
+        
+        if recent_searches.exists():
+            clicked_properties = SaleTransaction.objects.filter(
+                id__in=recent_searches.values_list('clicked_properties', flat=True)
+            )
+            
+            if clicked_properties.exists():
+                avg_price = clicked_properties.aggregate(Avg('price'))['price__avg']
+                avg_area = clicked_properties.aggregate(Avg('area'))['area__avg']
+                
+                queryset = queryset.annotate(
+                    price_similarity=Abs(F('price') - avg_price),
+                    area_similarity=Abs(F('area') - avg_area)
+                )
+
+        # 투자 목적인 경우 수익률 고려
+        if preference.investment_purpose:
+            queryset = queryset.annotate(
+                avg_lease_deposit=Subquery(
+                    LeaseTransaction.objects.filter(
+                        building=OuterRef('building'),
+                        lease_type='FULL'
+                    ).values('building')
+                    .annotate(avg_deposit=Avg('deposit'))
+                    .values('avg_deposit')[:1]
+                ),
+                avg_monthly_rent=Subquery(
+                    LeaseTransaction.objects.filter(
+                        building=OuterRef('building'),
+                        lease_type='MONTHLY'
+                    ).values('building')
+                    .annotate(avg_rent=Avg('monthly_rent'))
+                    .values('avg_rent')[:1]
+                )
+            ).annotate(
+                investment_score=Case(
+                    When(
+                        avg_lease_deposit__isnull=False,
+                        then=F('avg_lease_deposit') / F('price') * 100
+                    ),
+                    When(
+                        avg_monthly_rent__isnull=False,
+                        then=F('avg_monthly_rent') * 12 / F('price') * 100
+                    ),
+                    default=0,
+                    output_field=FloatField(),
+                )
+            )
+
+        # 최종 점수 계산 및 정렬
+        queryset = queryset.annotate(
+            recommendation_score=Case(
+                When(
+                    is_preferred_region=1,
+                    then=100
+                ),
+                default=50,
+                output_field=FloatField(),
+            )
+        )
+
+        if preference.investment_purpose:
+            queryset = queryset.order_by('-investment_score', '-recommendation_score')
+        else:
+            queryset = queryset.order_by('-recommendation_score', 'price_similarity')
+
+        # 페이지네이션 적용
+        page = self.paginate_queryset(queryset[:50])  # 상위 50개만 추천
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response({
+                'results': serializer.data,
+                'preference_used': True
+            })
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
