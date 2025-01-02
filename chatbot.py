@@ -5,8 +5,6 @@ import sqlite3
 from langgraph.graph import StateGraph, START, END
 from langchain.prompts import PromptTemplate
 from langchain_openai.chat_models.base import ChatOpenAI
-from langchain_community.utilities import SQLDatabase
-from langchain_experimental.sql import SQLDatabaseChain
 from langchain_community.utilities.sql_database import SQLDatabase
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
@@ -76,6 +74,7 @@ def get_db_engine(db_path):
     except Exception as e:
         print(f"데이터베이스 연결 중 오류 발생: {str(e)}")
         return None
+    
 # DB 파일 경로 지정
 db_path = './data/real_estate.db'
 engine = get_db_engine(db_path)
@@ -83,7 +82,6 @@ db = SQLDatabase(
     engine,
     sample_rows_in_table_info=False  # 샘플 행 조회 비활성화
 )
-sql_chain = SQLDatabaseChain(llm=llm, database=db, verbose=True)
 
 def property_rental(state: RealEstateState) -> RealEstateState:
     property_rental = db.get_table_info(table_names=["property_rentals", "property_info", "property_locations"])
